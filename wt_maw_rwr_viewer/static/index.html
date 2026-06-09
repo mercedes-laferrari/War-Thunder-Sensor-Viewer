@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>WT RWR / MAW Coverage Viewer</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --txt:#c9d1d9; --muted:#8b949e;
+    --accent:#58a6ff; --green:#3fb950; --red:#f85149; --chip:#21262d;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  header{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;
+    align-items:center;gap:16px;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .sub{color:var(--muted);font-size:12px}
+  header .controls{margin-left:auto;display:flex;gap:14px;align-items:center;font-size:13px}
+  label.tog{display:flex;gap:6px;align-items:center;cursor:pointer;color:var(--muted)}
+  #stage{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);
+    height:calc(100vh - 53px)}
+  .panel{background:var(--bg);display:flex;flex-direction:column;min-width:0;position:relative}
+  .pbar{padding:8px 10px;background:var(--panel);border-bottom:1px solid var(--border);
+    display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .pbar select,.pbar input{background:var(--chip);color:var(--txt);border:1px solid var(--border);
+    border-radius:6px;padding:5px 8px;font-size:13px;max-width:100%}
+  .pbar select.country{min-width:96px}
+  .pbar select.aircraft{flex:1;min-width:150px}
+  .pbar select.sensor{min-width:130px}
+  .canvas-wrap{flex:1;position:relative;min-height:0}
+  canvas{display:block;width:100%;height:100%}
+  .info{position:absolute;left:10px;top:10px;background:rgba(13,17,23,.82);
+    border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px;
+    max-width:280px;backdrop-filter:blur(4px);line-height:1.5;pointer-events:none}
+  .info .nm{font-size:13px;font-weight:600;color:#fff;margin-bottom:4px}
+  .info .row{color:var(--muted)}
+  .info .row b{color:var(--txt);font-weight:600}
+  .chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+  .chip{background:var(--chip);border:1px solid var(--border);border-radius:5px;
+    padding:1px 6px;font-size:11px;color:var(--accent)}
+  .legend{position:absolute;right:10px;bottom:10px;background:rgba(13,17,23,.82);
+    border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:11px;color:var(--muted)}
+  .legend .g{color:var(--green)} .legend .r{color:var(--red)}
+  .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    color:var(--muted);font-size:13px;text-align:center;padding:20px}
+  .empty[hidden],.info[hidden]{display:none}
+  .badge{font-size:10px;text-transform:uppercase;letter-spacing:.04em;border-radius:4px;
+    padding:1px 5px;border:1px solid var(--border)}
+  .badge.ext{color:#d29922;border-color:#9e6a03}
+  @media(max-width:760px){#stage{grid-template-columns:1fr;grid-template-rows:1fr 1fr;height:auto}
+    .canvas-wrap{min-height:45vh}}
+</style>
+</head>
+<body>
+<header>
+  <h1>WT RWR / MAW Coverage Viewer</h1>
+  <span class="sub" id="count"></span>
+  <div class="controls">
+    <label class="tog"><input type="checkbox" id="sync"/> Sync rotation</label>
+    <label class="tog"><input type="checkbox" id="spin"/> Auto-spin</label>
+    <label class="tog"><input type="checkbox" id="spokes" checked/> Spokes</label>
+    <label class="tog"><input type="checkbox" id="scaleRange"/> Scale by range</label>
+  </div>
+</header>
+<div id="stage"></div>
+
+<script src="three.min.js"></script>
+<script src="OrbitControls.js"></script>
+<script>
+const DEG = Math.PI/180;
+let DATA = null;
+
+// --- direction from azimuth(yaw,0=nose,+=starboard) & elevation(+=up); nose=+Z, right=+X, up=+Y
+function dir(azDeg, elDeg){
+  const az=azDeg*DEG, el=elDeg*DEG, ce=Math.cos(el);
+  return new THREE.Vector3(Math.sin(az)*ce, Math.sin(el), Math.cos(az)*ce);
+}
+function wrap180(d){ d%=360; if(d>180)d-=360; if(d<-180)d+=360; return d; }
+function covered(receivers, azDeg, elDeg){
+  return covMargin(receivers, azDeg, elDeg) >= 0;
+}
+// signed angular margin (deg) to the coverage boundary: >=0 inside any receiver
+// sector, increasingly negative the further a direction is outside all of them.
+function covMargin(receivers, azDeg, elDeg){
+  let best=-1e9;
+  for(const r of receivers){
+    const am = r.azW/2 - Math.abs(wrap180(azDeg - r.az));
+    const em = r.elW/2 - Math.abs(elDeg - r.el);
+    const m = Math.min(am, em);
+    if(m > best) best = m;
+  }
+  return best;
+}
+// radius factor: full (1) inside coverage; bends smoothly inward toward the plane
+// the deeper a direction is into the blind zone.
+const BEND_DEG=60, MIN_R=0.0;   // blind directions collapse all the way to plane centre
+function radiusFactor(margin){
+  if(margin >= 0) return 1;
+  const d = Math.min(-margin, BEND_DEG) / BEND_DEG;     // 0 at edge -> 1 deep blind
+  const e = d*d*(3-2*d);                                 // smoothstep
+  return 1 - (1-MIN_R)*e;
+}
+// fraction of sphere solid angle covered (area-weighted by cos el)
+function coverageFrac(receivers){
+  let cov=0,tot=0;
+  for(let el=-85; el<=85; el+=10){ const w=Math.cos(el*DEG);
+    for(let az=-175; az<=180; az+=10){ tot+=w; if(covered(receivers,az,el)) cov+=w; } }
+  return tot? cov/tot : 0;
+}
+
+// ---------- build a stylized jet mesh (nose = +Z) ----------
+function buildJet(){
+  const g=new THREE.Group();
+  const mat=new THREE.MeshStandardMaterial({color:0x222831,metalness:.4,roughness:.55,
+    emissive:0x05070a});
+  // fuselage
+  const fus=new THREE.Mesh(new THREE.CylinderGeometry(0.07,0.10,1.5,16), mat);
+  fus.rotation.x=Math.PI/2; g.add(fus);
+  // nose cone
+  const nose=new THREE.Mesh(new THREE.ConeGeometry(0.07,0.5,16), mat);
+  nose.rotation.x=Math.PI/2; nose.position.z=1.0; g.add(nose);
+  // main wings (delta-ish), span along X
+  const wing=new THREE.Mesh(new THREE.BoxGeometry(1.7,0.03,0.55), mat);
+  wing.position.z=-0.1; g.add(wing);
+  // tailplanes
+  const tail=new THREE.Mesh(new THREE.BoxGeometry(0.8,0.025,0.28), mat);
+  tail.position.z=-0.72; g.add(tail);
+  // vertical fin
+  const fin=new THREE.Mesh(new THREE.BoxGeometry(0.03,0.45,0.42), mat);
+  fin.position.set(0,0.22,-0.6); g.add(fin);
+  g.scale.setScalar(0.62);
+  return g;
+}
+
+// ---------- per-panel 3D viewer ----------
+class Viewer{
+  constructor(wrap){
+    this.wrap=wrap;
+    this.scene=new THREE.Scene();
+    this.camera=new THREE.PerspectiveCamera(40, 1, 0.05, 100);
+    this.camera.position.set(3.6,2.0,4.4);
+    this.renderer=new THREE.WebGLRenderer({antialias:true});
+    this.renderer.setPixelRatio(window.devicePixelRatio);
+    wrap.appendChild(this.renderer.domElement);
+    this.controls=new THREE.OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping=false;
+    this.controls.addEventListener('change',()=>requestFrame());
+    this.scene.add(new THREE.AmbientLight(0xffffff,.7));
+    const dl=new THREE.DirectionalLight(0xffffff,.7); dl.position.set(3,5,4); this.scene.add(dl);
+    this.jet=buildJet(); this.scene.add(this.jet);
+    this.cov=new THREE.Group(); this.scene.add(this.cov);
+    this.radius=1.5;
+    this.resize();
+  }
+  resize(){
+    const w=this.wrap.clientWidth||1, h=this.wrap.clientHeight||1;
+    this.renderer.setSize(w,h,false);
+    this.camera.aspect=w/h; this.camera.updateProjectionMatrix();
+  }
+  clearCov(){ while(this.cov.children.length){const c=this.cov.children.pop();
+    c.geometry&&c.geometry.dispose(); c.material&&c.material.dispose(); this.cov.remove(c);} }
+
+  setCoverage(receivers, radius, showSpokes){
+    this.clearCov();
+    if(!receivers){ return; }
+    const R=radius;
+    const GREEN=[0.25,0.83,0.31];
+    const azStep=6, elStep=6;
+    const verts=[], cols=[];
+    // draw only the covered (green) surface; blind directions are left empty
+    const addSeg=(a1,e1,a2,e2)=>{
+      if(covMargin(receivers,a1,e1)<0 || covMargin(receivers,a2,e2)<0) return;
+      const p=dir(a1,e1), q=dir(a2,e2);
+      verts.push(p.x*R,p.y*R,p.z*R, q.x*R,q.y*R,q.z*R);
+      cols.push(GREEN[0],GREEN[1],GREEN[2], GREEN[0],GREEN[1],GREEN[2]);
+    };
+    for(let el=-90; el<=90; el+=elStep)
+      for(let az=-180; az<180; az+=azStep) addSeg(az,el,az+azStep,el);
+    for(let az=-180; az<180; az+=azStep)
+      for(let el=-90; el<90; el+=elStep) addSeg(az,el,az,el+elStep);
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));
+    geo.setAttribute('color',new THREE.Float32BufferAttribute(cols,3));
+    const mat=new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity:.55});
+    this.cov.add(new THREE.LineSegments(geo,mat));
+
+    // radial spokes (coarse grid) center -> surface
+    if(showSpokes){
+      const sv=[], sc=[];
+      for(let el=-80; el<=80; el+=10){
+        for(let az=-180; az<180; az+=10){
+          if(covMargin(receivers,az,el)<0) continue;   // empty where blind
+          const p=dir(az,el);
+          sv.push(0,0,0, p.x*R,p.y*R,p.z*R);
+          sc.push(GREEN[0],GREEN[1],GREEN[2], GREEN[0],GREEN[1],GREEN[2]);
+        }
+      }
+      const sg=new THREE.BufferGeometry();
+      sg.setAttribute('position',new THREE.Float32BufferAttribute(sv,3));
+      sg.setAttribute('color',new THREE.Float32BufferAttribute(sc,3));
+      this.cov.add(new THREE.LineSegments(sg,
+        new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity:.32})));
+    }
+    this.radius=R;
+  }
+  render(){ this.controls.update(); this.renderer.render(this.scene,this.camera); }
+}
+
+// ---------- panel (UI + viewer) ----------
+class Panel{
+  constructor(idx){
+    this.idx=idx;
+    this.el=document.createElement('div'); this.el.className='panel';
+    this.el.innerHTML=`
+      <div class="pbar">
+        <select class="country" title="Country"></select>
+        <select class="aircraft" title="Aircraft"></select>
+        <select class="sensor" title="Sensor"></select>
+      </div>
+      <div class="canvas-wrap">
+        <div class="info" hidden></div>
+        <div class="legend"><span class="g">█</span> detected &nbsp;·&nbsp; blind = empty</div>
+        <div class="empty">Pick an aircraft to view its warning-receiver coverage.</div>
+      </div>`;
+    this.countrySel=this.el.querySelector('.country');
+    this.aircraftSel=this.el.querySelector('.aircraft');
+    this.sensorSel=this.el.querySelector('.sensor');
+    this.cwrap=this.el.querySelector('.canvas-wrap');
+    this.infoEl=this.el.querySelector('.info');
+    this.emptyEl=this.el.querySelector('.empty');
+    this.viewer=new Viewer(this.cwrap);
+    this.plane=null;
+
+    // populate country dropdown once
+    for(const c of COUNTRIES){
+      const o=document.createElement('option'); o.value=c; o.textContent=countryLabel(c);
+      this.countrySel.appendChild(o);
+    }
+    this.countrySel.addEventListener('change',()=>this.onCountry());
+    this.aircraftSel.addEventListener('change',()=>this.onAircraft());
+    this.sensorSel.addEventListener('change',()=>this.onSensor());
+  }
+  onCountry(){
+    const c=this.countrySel.value;
+    this.aircraftSel.innerHTML='';
+    for(const p of DATA.planes){
+      if(p.country!==c) continue;
+      const o=document.createElement('option'); o.value=p.id;
+      o.textContent=`${p.name} · R${p.rank}`;
+      this.aircraftSel.appendChild(o);
+    }
+    this.onAircraft();
+  }
+  onAircraft(){
+    const id=this.aircraftSel.value;
+    const p=DATA.planes.find(p=>p.id===id);
+    this.plane=p||null;
+    this.sensorSel.innerHTML='';
+    if(!p){ this.viewer.clearCov(); this.infoEl.hidden=true; this.emptyEl.hidden=false; return; }
+    const order={rwr:0,mlws:1,lws:2};
+    const ss=[...p.sensors].sort((a,b)=>order[a.type]-order[b.type]);
+    for(let i=0;i<ss.length;i++){
+      const s=ss[i], sd=DATA.sensors[s.file];
+      const o=document.createElement('option'); o.value=i;
+      o.textContent=`${TYPELABEL[s.type]} — ${sd.name}${s.external?'  (pod)':''}`;
+      this.sensorSel.appendChild(o);
+    }
+    this._sorted=ss;
+    this.sensorSel.value=0;
+    this.onSensor();
+  }
+  onSensor(){
+    if(!this.plane){return;}
+    const s=this._sorted[+this.sensorSel.value];
+    const sd=DATA.sensors[s.file];
+    // only directional receivers define the coverage shape; indicate:false ones are
+    // detect-only / angular-limit markers, not real bearing coverage
+    const recs=sd.receivers.filter(r=>r.ind!==false);
+    const detectOnly=sd.receivers.length-recs.length;
+    const frac=coverageFrac(recs);
+    let R=1.5;
+    if(SCALE_RANGE){
+      const rng=(sd.range||5000);
+      R=0.6 + 1.4*Math.min(1, Math.log10(rng)/5);  // 5km..100km -> ~1.1..2.0
+    }
+    this.viewer.setCoverage(recs, R, SHOW_SPOKES);
+    this.emptyEl.hidden=true;
+    this.renderInfo(s,sd,recs,detectOnly,frac);
+    requestFrame();
+  }
+  renderInfo(s,sd,recs,detectOnly,frac){
+    const rng = sd.range ? (sd.range/1000).toFixed(sd.range<10000?1:0)+' km' : '—';
+    let extra='';
+    if(s.type==='rwr'){
+      extra=`<div class="row">Launch warn: <b>${sd.detectLaunch?'Yes':'No'}</b> · Track warn: <b>${sd.detectTracking?'Yes':'No'}</b></div>`;
+    } else if(s.type==='mlws'){
+      extra=`<div class="row">Match sector: <b>${sd.matchSector??'—'}°</b> · Ang.rate max: <b>${sd.angularRateMax??'—'}°/s</b></div>`;
+    }
+    const azSpan = recSummary(recs);
+    this.infoEl.hidden=false;
+    this.infoEl.innerHTML=`
+      <div class="nm">${sd.name} <span class="badge ${s.external?'ext':''}">${s.external?'POD':TYPELABEL[s.type]}</span></div>
+      <div class="row"><b>${this.plane.name}</b> · ${this.plane.country.toUpperCase()} · Rank ${this.plane.rank}</div>
+      <div class="row">Type: <b>${TYPEFULL[s.type]}</b></div>
+      <div class="row">Detection range: <b>${rng}</b></div>
+      ${extra}
+      <div class="row">Receivers: <b>${recs.length}</b>${detectOnly?` <span style="color:var(--muted)">(+${detectOnly} detect-only)</span>`:''} · ${azSpan}</div>
+      <div class="row">Sphere coverage: <b>${(frac*100).toFixed(0)}%</b></div>
+      ${sd.bands.length?`<div class="row" style="margin-top:3px">Bands</div><div class="chips">${sd.bands.map(b=>`<span class="chip">${b}</span>`).join('')}</div>`:''}`;
+  }
+}
+
+function recSummary(recs){
+  // describe az/el extent
+  let azFull = recs.some(r=>r.azW>=350) || coverageAz360(recs);
+  const elMax=Math.min(90, Math.max(...recs.map(r=>r.el+r.elW/2)));
+  const elMin=Math.max(-90,Math.min(...recs.map(r=>r.el-r.elW/2)));
+  return (azFull?'360° az':'partial az')+`, el ${elMin.toFixed(0)}…${elMax.toFixed(0)}°`;
+}
+function coverageAz360(recs){
+  for(let az=-180;az<180;az+=5){ if(!recs.some(r=>Math.abs(wrap180(az-r.az))<=r.azW/2)) return false; }
+  return true;
+}
+
+const TYPELABEL={rwr:'RWR',mlws:'MAW',lws:'LWS'};
+const TYPEFULL={rwr:'Radar Warning Receiver',mlws:'Missile Approach Warning',lws:'Laser Warning System'};
+const CLABEL={usa:'USA',ussr:'USSR',germany:'Germany',britain:'Britain',japan:'Japan',
+  china:'China',italy:'Italy',france:'France',sweden:'Sweden',israel:'Israel'};
+function countryLabel(c){ return CLABEL[c] || (c? c[0].toUpperCase()+c.slice(1) : c); }
+let COUNTRIES=[];
+
+let SHOW_SPOKES=true, SCALE_RANGE=false, SYNC=false, SPIN=false;
+let panels=[];
+
+function init(data){
+  DATA=data;
+  document.getElementById('count').textContent =
+    `${data.planes.length} aircraft · ${Object.keys(data.sensors).length} sensors`;
+  // unique country list, ordered by aircraft count (major nations first)
+  const counts={};
+  for(const p of data.planes){ counts[p.country]=(counts[p.country]||0)+1; }
+  COUNTRIES=Object.keys(counts).sort((a,b)=>counts[b]-counts[a] || a.localeCompare(b));
+
+  const stage=document.getElementById('stage');
+  for(let i=0;i<2;i++){ const p=new Panel(i); panels.push(p); stage.appendChild(p.el); }
+  // now that panels are laid out, size the renderers to their real dimensions
+  panels.forEach(p=>p.viewer.resize());
+  // sensible defaults if present
+  preset(0,'rafale_c_f3'); preset(1,'mig_29_9_13');
+
+  // global toggles
+  document.getElementById('spokes').addEventListener('change',e=>{SHOW_SPOKES=e.target.checked; panels.forEach(p=>p.plane&&p.onSensor());});
+  document.getElementById('scaleRange').addEventListener('change',e=>{SCALE_RANGE=e.target.checked; panels.forEach(p=>p.plane&&p.onSensor());});
+  document.getElementById('sync').addEventListener('change',e=>{SYNC=e.target.checked; requestFrame();});
+  document.getElementById('spin').addEventListener('change',e=>{SPIN=e.target.checked; requestFrame();});
+
+  window.addEventListener('resize',()=>{panels.forEach(p=>p.viewer.resize()); requestFrame();});
+  renderOnce();
+}
+function preset(i,id){
+  const p=DATA.planes.find(p=>p.id===id) || DATA.planes.find(p=>p.id.includes(id));
+  if(!p) return;
+  const pn=panels[i];
+  pn.countrySel.value=p.country;
+  pn.onCountry();              // fills aircraft list for that country
+  pn.aircraftSel.value=p.id;
+  pn.onAircraft();             // selects plane + sensor
+}
+
+// On-demand render loop: runs frames only while there's something to animate
+// (spin / camera damping / sync) and otherwise idles, so screenshots can settle.
+let frameQueued=false;
+function requestFrame(){ if(!frameQueued){ frameQueued=true; requestAnimationFrame(renderOnce); } }
+function renderOnce(){
+  frameQueued=false;
+  if(SPIN){ for(const p of panels){ p.viewer.cov.rotation.y+=0.006; p.viewer.jet.rotation.y+=0.006; } }
+  if(SYNC && panels.length===2){
+    const a=panels[0].viewer, b=panels[1].viewer;
+    b.camera.position.copy(a.camera.position);
+    b.camera.quaternion.copy(a.camera.quaternion);
+    b.controls.target.copy(a.controls.target);
+  }
+  for(const p of panels) p.viewer.render();
+  // keep animating while spin is on or damping is still settling
+  if(SPIN || SYNC) requestFrame();
+}
+
+fetch('data.json').then(r=>r.json()).then(init).catch(e=>{
+  document.getElementById('stage').innerHTML='<div class="empty" style="position:static">Failed to load data.json — run extract.py and serve via serve.py</div>';
+  console.error(e);
+});
+</script>
+</body>
+</html>
